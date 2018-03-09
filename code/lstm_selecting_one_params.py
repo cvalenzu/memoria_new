@@ -39,7 +39,6 @@ from keras.layers import Dense
 from keras.layers import LSTM
 from keras import backend as K
 
-
 dataPath = args.path#"../data/canela.csv"
 input_dim = args.inputs
 output_dim = args.outputs
@@ -52,7 +51,7 @@ stateful = args.stateful
 verbose = args.verbose
 
 filename = os.path.basename(dataPath).replace(".csv","")
-file_path = "../results/params_lstm/{}_scores_lstm_{}_lags_{}_outs_{}_timesteps_{}_batch_{}_preprocess_{}_stateful.csv"
+file_path = "../results/params_lstm_recursive/{}_scores_lstm_{}_lags_{}_outs_{}_timesteps_{}_batch_{}_preprocess_{}_stateful.csv".format(filename,input_dim, output_dim,timesteps,batch_size, preprocess, stateful)
 
 if os.path.exists(file_path):
 	print("File Exists, Skipping")
@@ -60,10 +59,22 @@ if os.path.exists(file_path):
 
 def create_lstm(input_dim,output_dim,timesteps, nodes,loss='mean_squared_error',optimizer='adam',activation="tanh",recurrent_activation='hard_sigmoid', batch_size = 168,stateful=False):
     model = Sequential()
-    model.add(LSTM(nodes, input_shape=(timesteps,input_dim),activation=activation, recurrent_activation=recurrent_activation,stateful=stateful, batch_size=batch_size,unroll=True))
-    model.add(Dense(output_dim))
+    model.add(LSTM(nodes, input_shape=(None,input_dim),activation=activation, recurrent_activation=recurrent_activation,stateful=stateful, batch_size=batch_size))
+    model.add(Dense(1))
     model.compile(loss=loss, optimizer=optimizer)
     return model
+
+
+def n_predict(model,X,steps=12, batch_size=168):
+    y = np.empty((len(X),steps))
+    X_tmp = np.empty((X.shape[0], X.shape[1]+steps,X.shape[2]))
+    X_tmp[:,:X.shape[1], :] = X
+    for i in range(steps):
+        X_iter = X_tmp[:,:X.shape[1]+i,:]
+        y[:,i] = model.predict(X_iter,batch_size = batch_size)[:,0]
+        X_tmp[:,X.shape[1]+i,0] = y[:,i]
+    return y
+
 
 print("Reading Data")
 #Data split parameters
@@ -71,7 +82,8 @@ data = pd.Series.from_csv(dataPath)
 
 print("Preparing data")
 X,y = create_data_cube(data, input_dim=input_dim,timesteps=timesteps)
-
+y_multi = np.copy(y)
+y = y[:,0].reshape((-1,1))
 
 trainlen1 = int(train_perc*len(X))
 trainlen = int(train_perc*trainlen1)
@@ -84,7 +96,7 @@ vallen = vallen - (vallen%batch_size)
 X_train,X_test = X[:trainlen], X[trainlen:trainlen+vallen]
 y_train,y_test = y[:trainlen], y[trainlen:trainlen+vallen]
 y_train_orig  = y_train
-
+y_train_multi, y_test_multi = y_multi[:trainlen], y_multi[trainlen:trainlen+vallen]
 
 print("Preprocessing Data")
 
@@ -125,8 +137,8 @@ y_train = preproc_out.transform(y_train) if preproc_out else y_train
 print("Creating Param List")
 lsm_nodes = [32]
 loss = ["mean_squared_error"]
-activation = ["relu", "tanh", "sigmoid","linear"]
-recurrent_activation = ["hard_sigmoid","sigmoid","relu"]
+activation = ["relu", "tanh", "sigmoid"]
+recurrent_activation = ["hard_sigmoid","sigmoid"]
 param_grid = {"nodes":lsm_nodes,"loss":loss, "input_dim":[input_dim], "output_dim": [12], "timesteps":[timesteps],
               "activation":activation, "recurrent_activation":recurrent_activation, "batch_size":[batch_size]}
 params = ms.ParameterGrid(param_grid)
@@ -139,40 +151,31 @@ for param in params:
     print(param)
     np.random.seed(42)
     model = create_lstm(**param)
-
-    if stateful:
-        for i in range(epochs):
-            print("Epoch ",i)
-            model.reset_states()
-            model.fit(X_train, y_train,shuffle=False,verbose=verbose, epochs=1, batch_size=batch_size)
-    else:
-        model.fit(X_train, y_train,shuffle=False,verbose=verbose, epochs=epochs, batch_size=batch_size)
+    model.fit(X_train, y_train,shuffle=False,verbose=verbose, epochs=epochs, batch_size=batch_size)
     try:
-        y_approx_train = preproc_out.inverse_transform(model.predict(X_train,batch_size=batch_size))
-        score = metrics.mean_squared_error(y_train_orig, y_approx_train)
+        y_approx_train = n_predict(model,X_train,batch_size=batch_size)
+        for i in range(output_dim):
+            y_approx_train[:,i] = preproc_out.inverse_transform(y_approx_train[:,i].reshape((-1,1))).reshape(-1)
 
-        if stateful:
-            model.reset_states()
+        score = metrics.mean_squared_error(y_train_multi, y_approx_train)
 
         print("Score Train: ",score, end=" ")
         param["train_score"] = score
 
-        y_approx = preproc_out.inverse_transform(model.predict(X_test,batch_size=batch_size))
-        score = metrics.mean_squared_error(y_test,y_approx)
+        y_approx = n_predict(model,X_test,batch_size=batch_size)
+        for i in range(output_dim):
+            y_approx[:,i] =  preproc_out.inverse_transform(y_approx[:,i].reshape((-1,1))).reshape(-1)
+        score = metrics.mean_squared_error(y_test_multi,y_approx)
 
         print("Score Validation: ",score)
         param["validation_score"] = score
         scores.append(param)
-
-
-
-    except Exception as e:
-        print("Error")
-        print(str(e))
-        continue
-
+  
+    except:
+        print("Error")    
     del model
     K.clear_session()
+        
 
 scores = pd.DataFrame(scores)
 
@@ -180,5 +183,5 @@ scores = pd.DataFrame(scores)
 scores["source"] = filename
 scores["stateful"] = stateful
 scores["preproc"] = preprocess
-os.makedirs("../results/params_lstm",exist_ok=True)
-scores.to_csv("../results/params_lstm/{}_scores_lstm_{}_lags_{}_outs_{}_timesteps_{}_batch_{}_preprocess_{}_stateful.csv".format(filename,input_dim, output_dim,timesteps,batch_size, preprocess, stateful))
+os.makedirs("../results/params_lstm_recursive",exist_ok=True)
+scores.to_csv("../results/params_lstm_recursive/{}_scores_lstm_{}_lags_{}_outs_{}_timesteps_{}_batch_{}_preprocess_{}_stateful.csv".format(filename,input_dim, output_dim,timesteps,batch_size, preprocess, stateful))
